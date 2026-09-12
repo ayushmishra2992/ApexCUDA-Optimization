@@ -2,6 +2,7 @@ import time
 import numpy as np
 
 from backend.core.optimization_model import OptimizationResult
+from backend.backends.backend_selector import BackendSelector
 # NOTE: CUDABackend is imported lazily (inside the function that needs it)
 # rather than at module load time. cuda_backend.py imports cupy, which is
 # not installed on CPU-only machines; importing it eagerly here made the
@@ -102,7 +103,13 @@ class ADMMSolver:
         self.rho = float(rho)
         self.max_iterations = int(max_iterations)
         self.tolerance = float(tolerance)
-        self.backend = backend
+
+        self.backend = str(backend).lower()
+
+        if self.backend not in {"cpu", "cuda", "auto"}:
+            raise ValueError(
+                "backend must be 'cpu', 'cuda', or 'auto'."
+            )
 
         self.objective_history_ = []
         self.constraint_violation_history_ = []
@@ -482,6 +489,37 @@ class ADMMSolver:
     def solve(self, model):
 
         self._validate_model(model)
+
+        # ------------------------------------------------------------
+        # Backend selection
+        #
+        # cpu   -> force CPU
+        # cuda  -> force CUDA
+        # auto  -> cost-aware automatic selection
+        # ------------------------------------------------------------
+
+        requested_backend = self.backend
+
+        selector = BackendSelector(
+            expected_iterations=self.max_iterations
+        )
+
+        if requested_backend == "auto":
+            self.backend = selector.select(
+                model,
+                mode="auto"
+            )
+
+        elif requested_backend == "cuda":
+            # Validate that CUDA is actually available.
+            self.backend = selector.select(
+                model,
+                mode="cuda"
+            )
+
+        else:
+            self.backend = "cpu"
+
         if self.backend == "cuda":
             return self._solve_cuda(model)
 
