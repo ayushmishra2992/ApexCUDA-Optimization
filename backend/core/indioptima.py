@@ -10,6 +10,12 @@ def solve(model, backend="auto", rho=1.0, max_iterations=100):
     presolve_result = presolver.presolve(model)
 
     model = presolve_result.model
+    if backend not in {"auto", "cpu", "cuda"}:
+        raise ValueError(
+            f"Unsupported backend: {backend}. "
+            "Expected 'auto', 'cpu', or 'cuda'."
+        )
+    
     if backend == "auto":
         selector = BackendSelector()
         backend = selector.select(model)
