@@ -1,11 +1,17 @@
+import numpy as np
+from backend.core.optimization_model import OptimizationResult
 from backend.core.presolver import GenericPresolver
 from backend.core.solver import ADMMSolver
 from backend.core.milp_solver import MILPSolver
 from backend.backends.backend_selector import BackendSelector
+from backend.core.solver import (
+    ADMMSolver,
+    verify_solution
+)
 
 def solve(model, backend="auto", rho=1.0, max_iterations=100):
     
-
+    original_model = model
     presolver = GenericPresolver()
     presolve_result = presolver.presolve(model)
 
@@ -19,6 +25,22 @@ def solve(model, backend="auto", rho=1.0, max_iterations=100):
     if backend == "auto":
         selector = BackendSelector()
         backend = selector.select(model)
+
+    if presolve_result.status == "INFEASIBLE":
+        return OptimizationResult(
+            status="INFEASIBLE",
+            objective=np.inf if model.objective_sense == "min" else -np.inf,
+            solution=np.zeros(
+                presolve_result.original_variables,
+                dtype=float
+            ),
+            solve_time=0.0,
+            iterations=0,
+            constraint_violation=np.inf,
+            bound_violation=np.inf,
+            backend=backend,
+            problem_type=model.problem_type
+        )
 
     if model.problem_type == "LP":
 
@@ -42,6 +64,32 @@ def solve(model, backend="auto", rho=1.0, max_iterations=100):
         )
 
     result = solver.solve(model)
+
+    if result.solution is not None:
+        original_solution = presolve_result.postsolve(
+            result.solution
+        )
+
+        result.solution = original_solution
+
+        if presolve_result.objective_offset != 0.0:
+            result.objective += presolve_result.objective_offset
+
+        verification = verify_solution(
+            original_model,
+            result.solution
+        )
+
+        result.constraint_violation = verification[
+            "constraint_violation"
+        ]
+
+        result.bound_violation = verification[
+            "bound_violation"
+        ]
+
+        if not verification["feasible"]:
+            result.status = "VERIFICATION_FAILED"
 
     return result
 
