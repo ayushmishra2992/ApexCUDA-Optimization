@@ -26,6 +26,60 @@ def solve(model, backend="auto", rho=1.0, max_iterations=100):
         selector = BackendSelector()
         backend = selector.select(model)
 
+    if presolve_result.status == "UNBOUNDED":
+        return OptimizationResult(
+            status="UNBOUNDED",
+            objective=(
+                np.inf
+                if model.objective_sense == "min"
+                else -np.inf
+            ),
+            solution=np.full(
+                presolve_result.original_variables,
+                np.nan
+            ),
+            solve_time=0.0,
+            iterations=0,
+            constraint_violation=np.inf,
+            bound_violation=np.inf,
+            backend=backend,
+            problem_type=model.problem_type
+        )
+
+    if presolve_result.status == "SOLVED":
+        original_solution = presolve_result.postsolve(
+            np.array([], dtype=float)
+        )
+
+        objective = float(
+            original_model.objective @ original_solution
+        )
+
+        verification = verify_solution(
+            original_model,
+            original_solution
+        )
+
+        return OptimizationResult(
+            status=(
+                "OPTIMAL"
+                if verification["feasible"]
+                else "VERIFICATION_FAILED"
+            ),
+            objective=objective,
+            solution=original_solution,
+            solve_time=0.0,
+            iterations=0,
+            constraint_violation=verification[
+                "constraint_violation"
+            ],
+            bound_violation=verification[
+                "bound_violation"
+            ],
+            backend=backend,
+            problem_type=original_model.problem_type
+        )
+
     if presolve_result.status == "INFEASIBLE":
         return OptimizationResult(
             status="INFEASIBLE",

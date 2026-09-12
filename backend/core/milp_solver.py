@@ -185,10 +185,10 @@ class MILPSolver:
             incumbent_objective
         )
 
-        status = "FEASIBLE"
-
         if nodes:
             status = "NODE_LIMIT"
+        else:
+            status = "OPTIMAL"
 
         return OptimizationResult(
             status=status,
