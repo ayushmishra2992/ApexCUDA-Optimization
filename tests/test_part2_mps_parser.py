@@ -1,6 +1,6 @@
 import os
 import pytest
-from backend.mps_parser import MPSParser
+from backend.formats.mps_parser import MPSParser
 
 EXAMPLES_DIR = "examples"
 
