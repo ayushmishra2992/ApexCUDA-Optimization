@@ -320,7 +320,7 @@ def solve_example(req: SolveExampleRequest):
     try:
         from backend.formats.mps_parser import MPSParser
         from backend.core.presolver import GenericPresolver
-        from backend.core.milp_solver import MILPSolver
+        from backend.core.indioptima import solve as indioptima_solve
 
         t0 = time.perf_counter()
         model = MPSParser().parse(path)
@@ -332,8 +332,11 @@ def solve_example(req: SolveExampleRequest):
         presolve_ms = (time.perf_counter() - t1) * 1000
 
         t2 = time.perf_counter()
-        solver = MILPSolver(backend="gpu" if use_gpu else "cpu")
-        result = solver.solve(presolved_model)
+        result = indioptima_solve(
+            presolved_model,
+            backend="cuda" if use_gpu else "cpu",
+            max_iterations=100,
+        )
         solve_ms = (time.perf_counter() - t2) * 1000
 
         return _sanitize({
