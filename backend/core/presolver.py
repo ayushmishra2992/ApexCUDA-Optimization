@@ -21,6 +21,7 @@ class PresolveResult:
     fixed_variable_indices: list
     fixed_variable_values: np.ndarray
     reduced_to_original: np.ndarray
+    reduced_constraint_to_original: np.ndarray
     objective_offset: float = 0.0
     status: str = "OK"
     message: str = ""
@@ -67,10 +68,12 @@ class PresolveResult:
 
 class GenericPresolver:
     """
-    Generic presolve interface for OptimizationModel.
+    Generic sparse presolver for OptimizationModel.
 
-    Currently detects fixed variables without modifying
-    the model or its variable indexing.
+    Performs:
+    - fixed-variable elimination
+    - empty-row infeasibility detection
+    - redundant empty-row removal
     """
 
     def presolve(self, model):
@@ -79,40 +82,31 @@ class GenericPresolver:
             model.variable_lower == model.variable_upper
         )
 
-        fixed_variable_indices = np.where(fixed_mask)[0]
+        fixed_variable_indices = np.where(
+            fixed_mask
+        )[0]
+
         fixed_variable_values = model.variable_lower[
             fixed_mask
         ].copy()
 
-        # No fixed variables: preserve the original model.
-        if len(fixed_variable_indices) == 0:
-
-            reduced_to_original = np.arange(
-                model.n_variables,
-                dtype=int
-            )
-
-            return PresolveResult(
-                model=model,
-                original_variables=model.n_variables,
-                original_constraints=model.n_constraints,
-                reduced_variables=model.n_variables,
-                reduced_constraints=model.n_constraints,
-                fixed_variable_indices=[],
-                fixed_variable_values=np.array([], dtype=float),
-                reduced_to_original=reduced_to_original,
-                objective_offset=0.0,
-                status="OK",
-                message=""
-            )
-
         free_mask = ~fixed_mask
 
         # Contribution of fixed variables to every constraint.
-        fixed_matrix = model.A[:, fixed_mask]
-        fixed_contribution = np.asarray(
-            fixed_matrix @ fixed_variable_values
-        ).reshape(-1)
+        if len(fixed_variable_indices) > 0:
+
+            fixed_matrix = model.A[:, fixed_mask]
+
+            fixed_contribution = np.asarray(
+                fixed_matrix @ fixed_variable_values
+            ).reshape(-1)
+
+        else:
+
+            fixed_contribution = np.zeros(
+                model.n_constraints,
+                dtype=float
+            )
 
         reduced_lower = (
             model.constraint_lower - fixed_contribution
@@ -122,8 +116,33 @@ class GenericPresolver:
             model.constraint_upper - fixed_contribution
         )
 
-        # Detect infeasibility introduced by fixed-variable substitution.
-        if np.any(reduced_lower > reduced_upper):
+        # Keep only non-fixed columns.
+        reduced_A = model.A[:, free_mask].tocsr()
+
+        # Detect rows that contain no remaining variables.
+        row_nnz = np.diff(
+            reduced_A.indptr
+        )
+
+        empty_rows = (
+            row_nnz == 0
+        )
+
+        # An empty row represents:
+        #
+        #     lower <= 0 <= upper
+        #
+        # If zero is outside these bounds, the model is infeasible.
+        infeasible_empty_rows = (
+            empty_rows
+            & (
+                (reduced_lower > 0.0)
+                | (reduced_upper < 0.0)
+            )
+        )
+
+        if np.any(infeasible_empty_rows):
+
             return PresolveResult(
                 model=model,
                 original_variables=model.n_variables,
@@ -138,13 +157,36 @@ class GenericPresolver:
                     model.n_variables,
                     dtype=int
                 ),
+                reduced_constraint_to_original=np.arange(
+                    model.n_constraints,
+                    dtype=int
+                ),
                 objective_offset=0.0,
                 status="INFEASIBLE",
-                message="Fixed-variable substitution produced inconsistent constraint bounds."
+                message=(
+                    "An empty constraint row is infeasible "
+                    "after fixed-variable substitution."
+                )
             )
 
-        # Keep only non-fixed columns.
-        reduced_A = model.A[:, free_mask].tocsr()
+        # Remove feasible empty rows because they impose no restriction.
+        keep_rows = ~empty_rows
+
+        reduced_A = reduced_A[
+            keep_rows
+        ].tocsr()
+
+        reduced_lower = reduced_lower[
+            keep_rows
+        ]
+
+        reduced_upper = reduced_upper[
+            keep_rows
+        ]
+
+        reduced_constraint_to_original = np.where(
+            keep_rows
+        )[0].astype(int)
 
         reduced_objective = model.objective[
             free_mask
@@ -193,6 +235,9 @@ class GenericPresolver:
             ),
             fixed_variable_values=fixed_variable_values,
             reduced_to_original=reduced_to_original,
+            reduced_constraint_to_original=(
+                reduced_constraint_to_original
+            ),
             objective_offset=objective_offset,
             status="OK",
             message=""
