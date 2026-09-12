@@ -1,0 +1,11 @@
+airport,normal_hourly_capacity,fog_window_hourly_capacity,disruption_start_min,disruption_end_min
+DEL,40,10,360.0,570.0
+BOM,40,35,,
+BLR,40,35,,
+HYD,40,35,,
+CCU,40,35,,
+MAA,40,35,,
+AMD,40,35,,
+PNQ,40,35,,
+GOI,40,35,,
+COK,40,35,,

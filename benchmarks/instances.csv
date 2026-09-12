@@ -1,0 +1,6 @@
+Instance,Source,Type,Variables,Constraints,Nonzeros,Integer Vars,Source URL,License
+afiro,Netlib,LP,32,27,88,0,https://www.netlib.org/lp/data/afiro,Public Domain
+adlittle,Netlib,LP,97,56,465,0,https://www.netlib.org/lp/data/adlittle,Public Domain
+p0033,MIPLIB 2017,MILP,14,16,22,14,https://miplib.zib.de/instance_details_p0033.html,CC BY-SA 4.0
+stein27,MIPLIB 2017,MILP,9,5,9,9,https://miplib.zib.de/instance_details_stein27.html,CC BY-SA 4.0
+air04,MIPLIB 2017,MILP,8963,825,72848,8963,https://miplib.zib.de/instance_details_air04.html,CC BY-SA 4.0

@@ -1,0 +1,42 @@
+{
+    "afiro": {
+        "status": "HighsModelStatus.kOptimal",
+        "objective_value": -464.75314285714285,
+        "runtime_seconds": 0.006233,
+        "variables": 32,
+        "constraints": 27,
+        "type": "LP"
+    },
+    "adlittle": {
+        "status": "HighsModelStatus.kOptimal",
+        "objective_value": 225494.9631623803,
+        "runtime_seconds": 0.002231,
+        "variables": 97,
+        "constraints": 56,
+        "type": "LP"
+    },
+    "p0033": {
+        "status": "HighsModelStatus.kOptimal",
+        "objective_value": 0.0,
+        "runtime_seconds": 0.001794,
+        "variables": 14,
+        "constraints": 16,
+        "type": "MILP"
+    },
+    "stein27": {
+        "status": "HighsModelStatus.kOptimal",
+        "objective_value": 0.0,
+        "runtime_seconds": 0.000391,
+        "variables": 9,
+        "constraints": 5,
+        "type": "MILP"
+    },
+    "air04": {
+        "status": "HighsModelStatus.kOptimal",
+        "objective_value": 16873.0,
+        "runtime_seconds": 0.12863,
+        "variables": 8963,
+        "constraints": 825,
+        "type": "MILP"
+    }
+}
