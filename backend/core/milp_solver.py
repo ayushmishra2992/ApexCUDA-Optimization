@@ -1,9 +1,15 @@
 import time
+from dataclasses import dataclass
 import numpy as np
 
 from backend.core.optimization_model import OptimizationResult
 from backend.core.solver import verify_solution
 
+@dataclass
+class BBNode:
+    lower: np.ndarray
+    upper: np.ndarray
+    depth: int = 0
 
 class MILPSolver:
     """
@@ -51,7 +57,11 @@ class MILPSolver:
         root_upper = model.variable_upper.copy()
 
         nodes = [
-            (root_lower, root_upper)
+            BBNode(
+                lower=root_lower,
+                upper=root_upper,
+                depth=0
+            )
         ]
 
         incumbent_solution = None
@@ -64,7 +74,10 @@ class MILPSolver:
 
         while nodes and processed_nodes < self.max_nodes:
 
-            node_lower, node_upper = nodes.pop()
+            node = nodes.pop()
+
+            node_lower = node.lower
+            node_upper = node.upper
             processed_nodes += 1
 
             # Ignore invalid nodes.
@@ -146,7 +159,11 @@ class MILPSolver:
 
             if left_lower[fractional_index] <= left_upper[fractional_index]:
                 nodes.append(
-                    (left_lower, left_upper)
+                    BBNode(
+                        lower=left_lower,
+                        upper=left_upper,
+                        depth=node.depth + 1
+                    )
                 )
 
             # Right branch: x_i >= ceil(value)
@@ -160,7 +177,11 @@ class MILPSolver:
 
             if right_lower[fractional_index] <= right_upper[fractional_index]:
                 nodes.append(
-                    (right_lower, right_upper)
+                    BBNode(
+                        lower=right_lower,
+                        upper=right_upper,
+                        depth=node.depth + 1
+                    )
                 )
 
         solve_time = time.time() - start_time
