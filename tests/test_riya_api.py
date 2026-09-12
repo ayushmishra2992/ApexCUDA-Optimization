@@ -53,3 +53,39 @@ def test_architecture_endpoint():
     assert "indioptima" in stage_ids
     assert "backend" in stage_ids
     assert "solution" in stage_ids
+
+
+def test_solve_example_lp_uses_lp_pipeline():
+    response = client.post(
+        "/api/solve-example",
+        json={
+            "example": "tiny_max",
+            "backend": "cpu",
+        },
+    )
+
+    assert response.status_code == 200
+
+    data = response.json()
+
+    assert data["success"] is True
+    assert data["example"] == "tiny_max"
+    assert data["actual_backend"] == "cpu"
+    assert data["status"] is not None
+
+
+def test_solve_example_unknown_model_returns_error():
+    response = client.post(
+        "/api/solve-example",
+        json={
+            "example": "does_not_exist",
+            "backend": "cpu",
+        },
+    )
+
+    assert response.status_code == 200
+
+    data = response.json()
+
+    assert data["success"] is False
+    assert "error" in data
