@@ -1,8 +1,8 @@
 import time
 import numpy as np
 
-from backend.core.optimization_model import OptimizationModel
 from backend.core.optimization_model import OptimizationResult
+from backend.backends.backend_selector import BackendSelector
 from backend.core.presolver import GenericPresolver
 # NOTE: CUDABackend is imported lazily (inside the function that needs it)
 # rather than at module load time. cuda_backend.py imports cupy, which is
@@ -111,6 +111,8 @@ class ADMMSolver:
             raise ValueError(
                 "backend must be 'cpu', 'cuda', or 'auto'."
             )
+
+        self.requested_backend = self.backend
 
         self.objective_history_ = []
         self.constraint_violation_history_ = []
@@ -487,93 +489,9 @@ class ADMMSolver:
             problem_type=model.problem_type
         )
 
-    def solve(self, model):
+    def _solve_cpu(self, model):
 
         self._validate_model(model)
-                # ------------------------------------------------------------
-        # Presolve
-        # ------------------------------------------------------------
-
-        presolver = GenericPresolver()
-        presolve_result = presolver.presolve(model)
-
-        if presolve_result.status == "INFEASIBLE":
-            raise ValueError(
-                f"Presolve detected an infeasible model: "
-                f"{presolve_result.message}"
-            )
-
-        if presolve_result.status == "UNBOUNDED":
-            raise ValueError(
-                f"Presolve detected an unbounded model: "
-                f"{presolve_result.message}"
-            )
-
-        if presolve_result.status == "SOLVED":
-            solution = presolve_result.postsolve(
-                np.array([], dtype=float)
-            )
-
-            objective = float(
-                model.objective @ solution
-            )
-
-            verification = verify_solution(
-                model,
-                solution,
-                objective
-            )
-
-            return OptimizationResult(
-                status="FEASIBLE" if verification["feasible"] else "MAX_ITERATIONS_REACHED",
-                objective=objective,
-                solution=solution,
-                solve_time=0.0,
-                iterations=0,
-                constraint_violation=float(
-                    verification["constraint_violation"]
-                ),
-                bound_violation=float(
-                    verification["bound_violation"]
-                ),
-                backend=self.backend,
-                problem_type=model.problem_type
-            )
-
-        model = presolve_result.model
-
-        # ------------------------------------------------------------
-        # Backend selection
-        #
-        # cpu   -> force CPU
-        # cuda  -> force CUDA
-        # auto  -> cost-aware automatic selection
-        # ------------------------------------------------------------
-
-        requested_backend = self.backend
-
-        selector = BackendSelector(
-            expected_iterations=self.max_iterations
-        )
-
-        if requested_backend == "auto":
-            self.backend = selector.select(
-                model,
-                mode="auto"
-            )
-
-        elif requested_backend == "cuda":
-            # Validate that CUDA is actually available.
-            self.backend = selector.select(
-                model,
-                mode="cuda"
-            )
-
-        else:
-            self.backend = "cpu"
-
-        if self.backend == "cuda":
-            return self._solve_cuda(model)
 
         A = model.A
         objective = model.objective
@@ -834,5 +752,133 @@ class ADMMSolver:
                 verification["bound_violation"]
             ),
             backend=self.backend,
+            problem_type=model.problem_type
+        )
+
+    def solve(self, model):
+        """
+        Solve an LP through the full presolve -> backend -> postsolve flow.
+
+        The public model remains in the original variable space. Presolve may
+        reduce variables/constraints before the CPU or CUDA solver runs; the
+        reduced solution is then reconstructed and verified against the
+        original model.
+        """
+        self._validate_model(model)
+
+        total_start = time.perf_counter()
+
+        # ------------------------------------------------------------
+        # 1. Presolve
+        # ------------------------------------------------------------
+        presolver = GenericPresolver()
+        presolve_result = presolver.presolve(model)
+
+        if presolve_result.status in {"INFEASIBLE", "UNBOUNDED"}:
+            return OptimizationResult(
+                status=presolve_result.status,
+                objective=float("nan"),
+                solution=np.full(model.n_variables, np.nan, dtype=float),
+                solve_time=float(time.perf_counter() - total_start),
+                iterations=0,
+                constraint_violation=float("inf"),
+                bound_violation=float("inf"),
+                backend=self.requested_backend,
+                problem_type=model.problem_type
+            )
+
+        # ------------------------------------------------------------
+        # 2. Presolve may completely solve the model.
+        # ------------------------------------------------------------
+        if presolve_result.status == "SOLVED":
+            solution = presolve_result.postsolve(
+                np.empty(0, dtype=float)
+            )
+
+            objective = float(model.objective @ solution)
+            verification = verify_solution(
+                model,
+                solution,
+                objective
+            )
+
+            status = "FEASIBLE" if verification["feasible"] else "MAX_ITERATIONS_REACHED"
+
+            return OptimizationResult(
+                status=status,
+                objective=objective,
+                solution=solution,
+                solve_time=float(time.perf_counter() - total_start),
+                iterations=0,
+                constraint_violation=float(verification["constraint_violation"]),
+                bound_violation=float(verification["bound_violation"]),
+                backend=self.requested_backend,
+                problem_type=model.problem_type
+            )
+
+        reduced_model = presolve_result.model
+
+        # ------------------------------------------------------------
+        # 3. Backend selection on the REDUCED model.
+        # ------------------------------------------------------------
+        selector = BackendSelector(
+            expected_iterations=self.max_iterations
+        )
+
+        if self.requested_backend == "auto":
+            selected_backend = selector.select(
+                reduced_model,
+                mode="auto"
+            )
+        elif self.requested_backend == "cuda":
+            selected_backend = selector.select(
+                reduced_model,
+                mode="cuda"
+            )
+        else:
+            selected_backend = "cpu"
+
+        self.backend = selected_backend
+
+        # ------------------------------------------------------------
+        # 4. Solve the reduced model.
+        # ------------------------------------------------------------
+        if selected_backend == "cuda":
+            reduced_result = self._solve_cuda(reduced_model)
+        else:
+            reduced_result = self._solve_cpu(reduced_model)
+
+        # ------------------------------------------------------------
+        # 5. Postsolve back to original variable space.
+        # ------------------------------------------------------------
+        solution = presolve_result.postsolve(
+            reduced_result.solution
+        )
+
+        # ------------------------------------------------------------
+        # 6. Verify against the ORIGINAL model, not the reduced model.
+        # ------------------------------------------------------------
+        objective = float(model.objective @ solution)
+        verification = verify_solution(
+            model,
+            solution,
+            objective
+        )
+
+        status = reduced_result.status
+        if status == "CONVERGED":
+            status = "FEASIBLE" if verification["feasible"] else "MAX_ITERATIONS_REACHED"
+        elif status == "FEASIBLE" and not verification["feasible"]:
+            status = "MAX_ITERATIONS_REACHED"
+
+        return OptimizationResult(
+            status=status,
+            objective=objective,
+            solution=solution,
+            solve_time=float(time.perf_counter() - total_start),
+            iterations=reduced_result.iterations,
+            constraint_violation=float(verification["constraint_violation"]),
+            bound_violation=float(verification["bound_violation"]),
+            backend=selected_backend,
             problem_type=model.problem_type
         )
