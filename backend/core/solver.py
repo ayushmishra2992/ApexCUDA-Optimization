@@ -1,8 +1,9 @@
 import time
 import numpy as np
 
+from backend.core.optimization_model import OptimizationModel
 from backend.core.optimization_model import OptimizationResult
-from backend.backends.backend_selector import BackendSelector
+from backend.core.presolver import GenericPresolver
 # NOTE: CUDABackend is imported lazily (inside the function that needs it)
 # rather than at module load time. cuda_backend.py imports cupy, which is
 # not installed on CPU-only machines; importing it eagerly here made the
@@ -489,6 +490,57 @@ class ADMMSolver:
     def solve(self, model):
 
         self._validate_model(model)
+                # ------------------------------------------------------------
+        # Presolve
+        # ------------------------------------------------------------
+
+        presolver = GenericPresolver()
+        presolve_result = presolver.presolve(model)
+
+        if presolve_result.status == "INFEASIBLE":
+            raise ValueError(
+                f"Presolve detected an infeasible model: "
+                f"{presolve_result.message}"
+            )
+
+        if presolve_result.status == "UNBOUNDED":
+            raise ValueError(
+                f"Presolve detected an unbounded model: "
+                f"{presolve_result.message}"
+            )
+
+        if presolve_result.status == "SOLVED":
+            solution = presolve_result.postsolve(
+                np.array([], dtype=float)
+            )
+
+            objective = float(
+                model.objective @ solution
+            )
+
+            verification = verify_solution(
+                model,
+                solution,
+                objective
+            )
+
+            return OptimizationResult(
+                status="FEASIBLE" if verification["feasible"] else "MAX_ITERATIONS_REACHED",
+                objective=objective,
+                solution=solution,
+                solve_time=0.0,
+                iterations=0,
+                constraint_violation=float(
+                    verification["constraint_violation"]
+                ),
+                bound_violation=float(
+                    verification["bound_violation"]
+                ),
+                backend=self.backend,
+                problem_type=model.problem_type
+            )
+
+        model = presolve_result.model
 
         # ------------------------------------------------------------
         # Backend selection
