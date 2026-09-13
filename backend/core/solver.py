@@ -209,7 +209,15 @@ class ADMMSolver:
         No dense matrix is constructed.
         """
 
-        alpha = 0.95
+        coefficient_abs = np.abs(A.data)
+        if coefficient_abs.size == 0:
+            alpha = 0.95
+        else:
+            coefficient_ratio = (
+                float(np.max(coefficient_abs))
+                / max(float(np.min(coefficient_abs)), 1e-12)
+            )
+            alpha = 0.5 if coefficient_ratio > 1000.0 else 0.95
 
         column_scale = np.asarray(
             np.abs(A).sum(axis=0)

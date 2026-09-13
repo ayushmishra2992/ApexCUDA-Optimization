@@ -104,7 +104,7 @@ class MPSParser:
                         integer_variables.add(variable)
 
                     # COLUMNS may contain one or two row/value pairs
-                    for i in range(1, len(parts), 2):
+                    for i in range(1, len(parts) - 1, 2):
 
                         row_name = parts[i]
                         value = float(parts[i + 1])
