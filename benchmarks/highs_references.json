@@ -38,5 +38,29 @@
         "variables": 8963,
         "constraints": 825,
         "type": "MILP"
+    },
+    "bandm": {
+        "status": "HighsModelStatus.kOptimal",
+        "objective_value": -158.62801845012078,
+        "runtime_seconds": 0.036286899994593114,
+        "variables": 472,
+        "constraints": 305,
+        "type": "LP"
+    },
+    "sc105": {
+        "status": "HighsModelStatus.kOptimal",
+        "objective_value": -52.20206121170723,
+        "runtime_seconds": 0.0033392999903298914,
+        "variables": 103,
+        "constraints": 105,
+        "type": "LP"
+    },
+    "25fv47": {
+        "status": "HighsModelStatus.kOptimal",
+        "objective_value": 5501.845888286757,
+        "runtime_seconds": 0.3926807999960147,
+        "variables": 1571,
+        "constraints": 821,
+        "type": "LP"
     }
 }
