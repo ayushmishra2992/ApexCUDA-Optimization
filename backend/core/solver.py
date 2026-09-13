@@ -4,6 +4,8 @@ import numpy as np
 from backend.core.optimization_model import OptimizationModel
 from backend.core.optimization_model import OptimizationResult
 
+from backend.backends.backend_selector import BackendSelector
+from backend.core.presolver import GenericPresolver
 
 def constraint_violation(Ax, lower, upper):
     lower_violation = np.maximum(lower - Ax, 0)
@@ -115,7 +117,7 @@ class ADMMSolver:
         self.rho = float(rho)
         self.max_iterations = int(max_iterations)
         self.tolerance = float(tolerance)
-        self.backend = backend
+        self.backend = str(backend).lower()
         self.initial_theta = 1.0
         self.min_theta = 1.0
         self.max_theta = 1.0
@@ -162,10 +164,10 @@ class ADMMSolver:
                 "tolerance must be positive."
             )
 
-        if self.backend not in {"cpu", "cuda"}:
+        if self.backend not in {"cpu", "cuda", "auto"}:
             raise ValueError(
                 f"Unsupported backend: {self.backend}. "
-                "Expected 'cpu' or 'cuda'."
+                "Expected 'cpu', 'cuda', or 'auto'."
             )
 
     def _reset_histories(self):
@@ -651,6 +653,9 @@ class ADMMSolver:
     def solve(self, model):
         self._validate_model(model)
 
+        if self.backend == "auto":
+            self.backend = BackendSelector().select(model, mode="auto")
+
         if self.backend == "cuda":
             return self._solve_cuda(model)
 
@@ -921,3 +926,4 @@ class ADMMSolver:
             backend=self.backend,
             problem_type=model.problem_type
         )
+

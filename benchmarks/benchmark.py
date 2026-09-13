@@ -1,7 +1,7 @@
+from pathlib import Path
 import csv
 import json
 import time
-from pathlib import Path
 
 from backend.formats.mps_parser import MPSParser
 from backend.core.indioptima import solve
@@ -23,11 +23,36 @@ def run_benchmark(
 
     parser = MPSParser()
 
-    parse_start = time.time()
-    model = parser.parse(filepath)
-    parse_time = time.time() - parse_start
+    parse_start = time.perf_counter()
 
-    solve_start = time.time()
+    try:
+        model = parser.parse(filepath)
+    except Exception as exc:
+        return {
+            "file": filepath,
+            "problem_type": None,
+            "objective_sense": None,
+            "variables": None,
+            "constraints": None,
+            "nonzeros": None,
+            "integer_variables": None,
+            "continuous_variables": None,
+            "requested_backend": backend,
+            "selected_backend": None,
+            "status": "PARSE_ERROR",
+            "objective": None,
+            "iterations": None,
+            "constraint_violation": None,
+            "bound_violation": None,
+            "parse_time": time.perf_counter() - parse_start,
+            "solve_time": 0.0,
+            "wall_time": time.perf_counter() - parse_start,
+            "backend": None,
+            "message": str(exc),
+        }
+
+    parse_time = time.perf_counter() - parse_start
+    solve_start = time.perf_counter()
 
     try:
         result = solve(
@@ -38,6 +63,8 @@ def run_benchmark(
         )
 
     except NotImplementedError as exc:
+        solve_time = time.perf_counter() - solve_start
+
         return {
             "file": filepath,
             "problem_type": model.problem_type,
@@ -47,18 +74,48 @@ def run_benchmark(
             "nonzeros": model.nnz,
             "integer_variables": model.n_integer_variables,
             "continuous_variables": model.n_continuous_variables,
-            "parse_time": parse_time,
-            "solve_time": None,
+            "requested_backend": backend,
+            "selected_backend": None,
             "status": "NOT_SUPPORTED",
-            "message": str(exc),
             "objective": None,
             "iterations": None,
             "constraint_violation": None,
             "bound_violation": None,
-            "backend": backend,
+            "parse_time": parse_time,
+            "solve_time": solve_time,
+            "wall_time": parse_time + solve_time,
+            "backend": None,
+            "message": str(exc),
         }
 
-    solve_time = time.time() - solve_start
+    except Exception as exc:
+        solve_time = time.perf_counter() - solve_start
+
+        return {
+            "file": filepath,
+            "problem_type": model.problem_type,
+            "objective_sense": model.objective_sense,
+            "variables": model.n_variables,
+            "constraints": model.n_constraints,
+            "nonzeros": model.nnz,
+            "integer_variables": model.n_integer_variables,
+            "continuous_variables": model.n_continuous_variables,
+            "requested_backend": backend,
+            "selected_backend": None,
+            "status": "SOLVE_ERROR",
+            "objective": None,
+            "iterations": None,
+            "constraint_violation": None,
+            "bound_violation": None,
+            "parse_time": parse_time,
+            "solve_time": solve_time,
+            "wall_time": parse_time + solve_time,
+            "backend": None,
+            "message": str(exc),
+        }
+
+    solve_time = time.perf_counter() - solve_start
+    selected_backend = getattr(result, "backend", None)
 
     return {
         "file": filepath,
@@ -69,14 +126,18 @@ def run_benchmark(
         "nonzeros": model.nnz,
         "integer_variables": model.n_integer_variables,
         "continuous_variables": model.n_continuous_variables,
-        "parse_time": parse_time,
-        "solve_time": solve_time,
+        "requested_backend": backend,
+        "selected_backend": selected_backend,
         "status": result.status,
         "objective": result.objective,
         "iterations": result.iterations,
         "constraint_violation": result.constraint_violation,
         "bound_violation": result.bound_violation,
-        "backend": result.backend,
+        "parse_time": parse_time,
+        "solve_time": solve_time,
+        "wall_time": parse_time + solve_time,
+        "backend": selected_backend,
+        "message": getattr(result, "message", ""),
     }
 
 
@@ -144,6 +205,8 @@ def save_results_csv(results, output_path):
         "bound_violation",
         "parse_time",
         "solve_time",
+        "requested_backend",
+        "selected_backend",
         "backend"
     ]
 
@@ -210,6 +273,12 @@ def save_results_csv(results, output_path):
                 "solve_time":
                     result.get("solve_time"),
 
+                "requested_backend":
+                    result.get("requested_backend"),
+
+                "selected_backend":
+                    result.get("selected_backend"),
+
                 "backend":
                     result.get("backend")
             })
@@ -245,10 +314,6 @@ def main():
         / "benchmarks"
         / "highs_references.json"
     )
-
-    # ---------------------------------------------------------
-    # Load benchmark instances
-    # ---------------------------------------------------------
 
     filepaths = []
 
@@ -295,18 +360,10 @@ def main():
         "Maximum LP iterations: 5000"
     )
 
-    # ---------------------------------------------------------
-    # Run IndiOptima benchmarks
-    # ---------------------------------------------------------
-
     results = run_benchmarks(
         filepaths,
         max_iterations=5000
     )
-
-    # ---------------------------------------------------------
-    # Save benchmark results
-    # ---------------------------------------------------------
 
     results_path = (
         project_root
@@ -319,10 +376,6 @@ def main():
         results,
         results_path
     )
-
-    # ---------------------------------------------------------
-    # Print IndiOptima results
-    # ---------------------------------------------------------
 
     print("\n")
     print("=" * 70)
@@ -409,10 +462,6 @@ def main():
                 f"{result['message']}"
             )
 
-    # ---------------------------------------------------------
-    # Load HiGHS reference results
-    # ---------------------------------------------------------
-
     with open(
         reference_path,
         "r",
@@ -420,10 +469,6 @@ def main():
     ) as file:
 
         references = json.load(file)
-
-    # ---------------------------------------------------------
-    # Compare IndiOptima with HiGHS
-    # ---------------------------------------------------------
 
     comparison_results = {}
 
@@ -445,10 +490,6 @@ def main():
             "result": result,
             "comparison": comparison
         }
-
-    # ---------------------------------------------------------
-    # Print detailed comparison table
-    # ---------------------------------------------------------
 
     print("\n")
     print("=" * 120)
