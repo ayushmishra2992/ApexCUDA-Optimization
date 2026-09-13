@@ -4,10 +4,7 @@ import numpy as np
 from backend.core.optimization_model import OptimizationResult
 from backend.backends.backend_selector import BackendSelector
 from backend.core.presolver import GenericPresolver
-# NOTE: CUDABackend is imported lazily (inside the function that needs it)
-# rather than at module load time. cuda_backend.py imports cupy, which is
-# not installed on CPU-only machines; importing it eagerly here made the
-# entire solver (including pure-CPU solves) fail to import without CuPy.
+
 
 def constraint_violation(Ax, lower, upper):
     lower_violation = np.maximum(lower - Ax, 0)
@@ -41,7 +38,10 @@ def integrality_violation(x, integrality):
 
     return float(
         np.max(
-            np.abs(x[integer_mask] - np.round(x[integer_mask]))
+            np.abs(
+                x[integer_mask] -
+                np.round(x[integer_mask])
+            )
         )
     )
 
@@ -91,6 +91,20 @@ def verify_solution(
 
 
 class ADMMSolver:
+    """
+    Sparse primal-dual hybrid gradient solver.
+
+    The class name is retained as ADMMSolver for API compatibility.
+
+    The implementation uses:
+        1. Sparse numerical equilibration.
+        2. Diagonally preconditioned PDHG.
+
+    Scaling is applied internally and the final solution is mapped
+    back to the original variable space before verification.
+
+    Supports LP models on CPU and CUDA backends.
+    """
 
     def __init__(
         self,
@@ -99,25 +113,28 @@ class ADMMSolver:
         tolerance=1e-6,
         backend="cpu"
     ):
-        # Keep rho for API compatibility.
-        # The new primal-dual method uses adaptive step sizes.
         self.rho = float(rho)
         self.max_iterations = int(max_iterations)
         self.tolerance = float(tolerance)
-
         self.backend = str(backend).lower()
+        self.requested_backend = self.backend
 
         if self.backend not in {"cpu", "cuda", "auto"}:
-            raise ValueError(
-                "backend must be 'cpu', 'cuda', or 'auto'."
-            )
+            raise ValueError("backend must be 'cpu', 'cuda', or 'auto'.")
 
-        self.requested_backend = self.backend
+        self.initial_theta = 1.0
+        self.min_theta = 1.0
+        self.max_theta = 1.0
+        self.theta_increase = 1.0
+        self.theta_decrease = 1.0
 
         self.objective_history_ = []
         self.constraint_violation_history_ = []
         self.primal_residual_history_ = []
         self.dual_residual_history_ = []
+
+        self.row_scaling_ = None
+        self.column_scaling_ = None
 
     def _validate_model(self, model):
         if model.problem_type != "LP":
@@ -141,73 +158,162 @@ class ADMMSolver:
                 "Objective length does not match A."
             )
 
-    def _estimate_operator_norm(self, A):
-        """
-        Estimate ||A||_2 using power iteration.
+        if self.max_iterations <= 0:
+            raise ValueError(
+                "max_iterations must be positive."
+            )
 
-        This avoids explicitly forming A.T @ A.
-        """
-        n = A.shape[1]
+        if self.tolerance <= 0:
+            raise ValueError(
+                "tolerance must be positive."
+            )
 
-        rng = np.random.default_rng(42)
-        x = rng.standard_normal(n)
+        if self.backend not in {"cpu", "cuda", "auto"}:
+            raise ValueError(
+                f"Unsupported backend: {self.backend}. "
+                "Expected 'cpu', 'cuda', or 'auto'."
+            )
 
-        norm_x = np.linalg.norm(x)
-
-        if norm_x == 0:
-            return 1.0
-
-        x /= norm_x
-
-        for _ in range(20):
-            y = A @ x
-            z = A.T @ y
-
-            norm_z = np.linalg.norm(z)
-
-            if norm_z == 0:
-                return 1.0
-
-            x = z / norm_z
-
-        Ax = A @ x
-        norm_Ax = np.linalg.norm(Ax)
-
-        if norm_Ax == 0:
-            return 1.0
-
-        return float(norm_Ax)
-
-    def _solve_cuda(self, model):
-        self._validate_model(model)
-
-
-        A = model.A
-        objective = model.objective
-        constraint_lower = model.constraint_lower
-        constraint_upper = model.constraint_upper
-        variable_lower = model.variable_lower
-        variable_upper = model.variable_upper
-
-        n = model.n_variables
-        m = model.n_constraints
-
+    def _reset_histories(self):
         self.objective_history_ = []
         self.constraint_violation_history_ = []
         self.primal_residual_history_ = []
         self.dual_residual_history_ = []
 
+    def _equilibrate_model(self, model, passes=5):
+        """
+        Keep the model in its original sparse numerical scale.
+
+        The solver uses diagonal PDHG preconditioning directly from the
+        sparse coefficient magnitudes.  Identity scaling is intentional:
+        it avoids introducing an additional numerical transformation that
+        can slow convergence on small and moderately scaled LPs.
+        """
+        self.row_scaling_ = np.ones(model.n_constraints, dtype=float)
+        self.column_scaling_ = np.ones(model.n_variables, dtype=float)
+        return model
+
+    def _unscale_solution(self, scaled_solution):
+        if self.column_scaling_ is None:
+            return scaled_solution.copy()
+
+        return (
+            self.column_scaling_ *
+            scaled_solution
+        )
+
+    def _compute_diagonal_preconditioner(self, A):
+        """
+        Construct diagonal PDHG step sizes from sparse row/column
+        absolute coefficient sums.
+
+            tau_j   = alpha / sum_i |A_ij|
+            sigma_i = alpha / sum_j |A_ij|
+
+        Zero rows/columns receive a finite fallback.
+
+        No dense matrix is constructed.
+        """
+
+        coefficient_abs = np.abs(A.data)
+        if coefficient_abs.size == 0:
+            alpha = 0.95
+        else:
+            coefficient_ratio = (
+                float(np.max(coefficient_abs))
+                / max(float(np.min(coefficient_abs)), 1e-12)
+            )
+            alpha = 0.5 if coefficient_ratio > 1000.0 else 0.95
+
+        column_scale = np.asarray(
+            np.abs(A).sum(axis=0)
+        ).ravel()
+
+        row_scale = np.asarray(
+            np.abs(A).sum(axis=1)
+        ).ravel()
+
+        column_scale = np.maximum(
+            column_scale,
+            1e-12
+        )
+
+        row_scale = np.maximum(
+            row_scale,
+            1e-12
+        )
+
+        tau = alpha / column_scale
+        sigma = alpha / row_scale
+
+        tau = np.clip(
+            tau,
+            1e-12,
+            1e6
+        )
+
+        sigma = np.clip(
+            sigma,
+            1e-12,
+            1e6
+        )
+
+        return (
+            tau.astype(float),
+            sigma.astype(float)
+        )
+
+    def _normalized_residual(self, current, previous):
+        numerator = np.linalg.norm(
+            current - previous
+        )
+
+        denominator = max(
+            1.0,
+            np.linalg.norm(current)
+        )
+
+        return float(
+            numerator / denominator
+        )
+
+    def _adapt_theta(self, theta, current_violation, previous_violation):
+        return 1.0
+
+    def _solve_cuda(self, model):
+        self._validate_model(model)
+        self._reset_histories()
+
+        scaled_model = self._equilibrate_model(
+            model
+        )
+
+        A = scaled_model.A
+
+        objective = scaled_model.objective
+        constraint_lower = (
+            scaled_model.constraint_lower
+        )
+        constraint_upper = (
+            scaled_model.constraint_upper
+        )
+
+        variable_lower = (
+            scaled_model.variable_lower
+        )
+        variable_upper = (
+            scaled_model.variable_upper
+        )
+
+        n = scaled_model.n_variables
+        m = scaled_model.n_constraints
+
         start_time = time.perf_counter()
 
-        # Convert maximization into minimization.
-        if model.objective_sense == "min":
+        if scaled_model.objective_sense == "min":
             c = objective.copy()
         else:
             c = -objective.copy()
-
-        # ------------------------------------------------------------
-        # CUDA setup
-        # ------------------------------------------------------------
 
         import cupy as cp
         from backend.backends.cuda_backend import CUDABackend
@@ -215,158 +321,176 @@ class ADMMSolver:
         cuda = CUDABackend(A)
 
         c_gpu = cp.asarray(c)
-        lower_gpu = cp.asarray(constraint_lower)
-        upper_gpu = cp.asarray(constraint_upper)
-        variable_lower_gpu = cp.asarray(variable_lower)
-        variable_upper_gpu = cp.asarray(variable_upper)
+        lower_gpu = cp.asarray(
+            constraint_lower
+        )
+        upper_gpu = cp.asarray(
+            constraint_upper
+        )
 
-        # ------------------------------------------------------------
-        # Initial point
-        # ------------------------------------------------------------
+        variable_lower_gpu = cp.asarray(
+            variable_lower
+        )
+        variable_upper_gpu = cp.asarray(
+            variable_upper
+        )
+
+        tau_cpu, sigma_cpu = (
+            self._compute_diagonal_preconditioner(
+                A
+            )
+        )
+
+        tau_gpu = cp.asarray(tau_cpu)
+        sigma_gpu = cp.asarray(sigma_cpu)
 
         x = cp.zeros(n)
 
-        finite_lower = np.isfinite(variable_lower)
-        finite_upper = np.isfinite(variable_upper)
-
-        x[finite_lower] = cp.maximum(
-            x[finite_lower],
-            variable_lower_gpu[finite_lower]
+        finite_lower = np.isfinite(
+            variable_lower
         )
 
-        x[finite_upper] = cp.minimum(
-            x[finite_upper],
-            variable_upper_gpu[finite_upper]
+        finite_upper = np.isfinite(
+            variable_upper
         )
+
+        if np.any(finite_lower):
+            x[finite_lower] = cp.maximum(
+                x[finite_lower],
+                variable_lower_gpu[
+                    finite_lower
+                ]
+            )
+
+        if np.any(finite_upper):
+            x[finite_upper] = cp.minimum(
+                x[finite_upper],
+                variable_upper_gpu[
+                    finite_upper
+                ]
+            )
 
         x_bar = x.copy()
-
-        # Dual variable
         y = cp.zeros(m)
 
-        # ------------------------------------------------------------
-        # Estimate operator norm on GPU
-        # ------------------------------------------------------------
-
-        rng = cp.random.default_rng(42)
-        x_norm = rng.standard_normal(n)
-
-        norm_x = cp.linalg.norm(x_norm)
-
-        if norm_x == 0:
-            operator_norm = 1.0
-        else:
-            x_norm /= norm_x
-
-            for _ in range(20):
-                y_norm = cuda.matvec(x_norm)
-                z_norm = cuda.rmatvec(y_norm)
-
-                norm_z = cp.linalg.norm(z_norm)
-
-                if norm_z == 0:
-                    break
-
-                x_norm = z_norm / norm_z
-
-            Ax_norm = cuda.matvec(x_norm)
-            operator_norm = float(
-                cp.linalg.norm(Ax_norm).get()
-            )
-
-            if operator_norm <= 1e-12:
-                operator_norm = 1.0
-
-        # ------------------------------------------------------------
-        # PDHG step sizes
-        # ------------------------------------------------------------
-
-        tau = 0.9 / operator_norm
-        sigma = 0.9 / operator_norm
-        theta = 1.0
+        theta = self.initial_theta
+        previous_violation = np.inf
 
         status = "MAX_ITERATIONS_REACHED"
+        iteration = 0
 
-        # ------------------------------------------------------------
-        # PDHG iterations
-        # ------------------------------------------------------------
+        finite_lower_constraint = cp.isfinite(
+            lower_gpu
+        )
 
-        for iteration in range(1, self.max_iterations + 1):
+        finite_upper_constraint = cp.isfinite(
+            upper_gpu
+        )
 
-            # --------------------------------------------------------
-            # Dual update
-            # --------------------------------------------------------
+        finite_lower_variable = cp.isfinite(
+            variable_lower_gpu
+        )
 
+        finite_upper_variable = cp.isfinite(
+            variable_upper_gpu
+        )
+
+        for iteration in range(
+            1,
+            self.max_iterations + 1
+        ):
             y_previous = y.copy()
 
-            v = y + sigma * cuda.matvec(x_bar)
-
-            z = v / sigma
-
-            finite_lower_constraint = cp.isfinite(
-                lower_gpu
-            )
-            finite_upper_constraint = cp.isfinite(
-                upper_gpu
+            v = (
+                y +
+                sigma_gpu *
+                cuda.matvec(x_bar)
             )
 
-            z[finite_lower_constraint] = cp.maximum(
-                z[finite_lower_constraint],
-                lower_gpu[finite_lower_constraint]
-            )
+            z = v / sigma_gpu
 
-            z[finite_upper_constraint] = cp.minimum(
-                z[finite_upper_constraint],
-                upper_gpu[finite_upper_constraint]
-            )
+            if bool(
+                cp.any(
+                    finite_lower_constraint
+                )
+            ):
+                z[finite_lower_constraint] = (
+                    cp.maximum(
+                        z[
+                            finite_lower_constraint
+                        ],
+                        lower_gpu[
+                            finite_lower_constraint
+                        ]
+                    )
+                )
 
-            y = v - sigma * z
+            if bool(
+                cp.any(
+                    finite_upper_constraint
+                )
+            ):
+                z[finite_upper_constraint] = (
+                    cp.minimum(
+                        z[
+                            finite_upper_constraint
+                        ],
+                        upper_gpu[
+                            finite_upper_constraint
+                        ]
+                    )
+                )
 
-            # --------------------------------------------------------
-            # Primal update
-            # --------------------------------------------------------
+            y = v - sigma_gpu * z
 
             x_previous = x.copy()
 
-            x = x - tau * (
-                c_gpu + cuda.rmatvec(y)
+            x = x - tau_gpu * (
+                c_gpu +
+                cuda.rmatvec(y)
             )
 
-            # Project onto variable bounds.
-            finite_lower_variable = cp.isfinite(
-                variable_lower_gpu
+            if bool(
+                cp.any(
+                    finite_lower_variable
+                )
+            ):
+                x[finite_lower_variable] = (
+                    cp.maximum(
+                        x[
+                            finite_lower_variable
+                        ],
+                        variable_lower_gpu[
+                            finite_lower_variable
+                        ]
+                    )
+                )
+
+            if bool(
+                cp.any(
+                    finite_upper_variable
+                )
+            ):
+                x[finite_upper_variable] = (
+                    cp.minimum(
+                        x[
+                            finite_upper_variable
+                        ],
+                        variable_upper_gpu[
+                            finite_upper_variable
+                        ]
+                    )
+                )
+
+            x_bar = x + theta * (
+                x - x_previous
             )
-            finite_upper_variable = cp.isfinite(
-                variable_upper_gpu
-            )
-
-            x[finite_lower_variable] = cp.maximum(
-                x[finite_lower_variable],
-                variable_lower_gpu[finite_lower_variable]
-            )
-
-            x[finite_upper_variable] = cp.minimum(
-                x[finite_upper_variable],
-                variable_upper_gpu[finite_upper_variable]
-            )
-
-            # --------------------------------------------------------
-            # Extrapolation
-            # --------------------------------------------------------
-
-            x_bar = x + theta * (x - x_previous)
-
-            # --------------------------------------------------------
-            # Diagnostics
-            #
-            # Only synchronize every 10 iterations to reduce
-            # CPU-GPU synchronization overhead.
-            # --------------------------------------------------------
 
             if (
                 iteration == 1
                 or iteration % 10 == 0
-                or iteration == self.max_iterations
+                or iteration ==
+                self.max_iterations
             ):
                 Ax_gpu = cuda.matvec(x)
 
@@ -405,21 +529,44 @@ class ADMMSolver:
                 )
 
                 primal_residual = float(
-                    cp.linalg.norm(
-                        x - x_previous
+                    (
+                        cp.linalg.norm(
+                            x - x_previous
+                        )
+                        /
+                        cp.maximum(
+                            1.0,
+                            cp.linalg.norm(x)
+                        )
                     ).get()
                 )
 
                 dual_residual = float(
-                    cp.linalg.norm(
-                        y - y_previous
+                    (
+                        cp.linalg.norm(
+                            y - y_previous
+                        )
+                        /
+                        cp.maximum(
+                            1.0,
+                            cp.linalg.norm(y)
+                        )
                     ).get()
                 )
 
-                x_cpu_diagnostic = cp.asnumpy(x)
+                x_cpu_diagnostic = (
+                    cp.asnumpy(x)
+                )
+
+                x_original = (
+                    self._unscale_solution(
+                        x_cpu_diagnostic
+                    )
+                )
 
                 original_objective = float(
-                    objective @ x_cpu_diagnostic
+                    model.objective @
+                    x_original
                 )
 
                 self.objective_history_.append(
@@ -430,6 +577,13 @@ class ADMMSolver:
                     current_constraint_violation
                 )
 
+                theta = self._adapt_theta(
+                    theta,
+                    current_constraint_violation,
+                    previous_violation
+                )
+                previous_violation = current_constraint_violation
+
                 self.primal_residual_history_.append(
                     primal_residual
                 )
@@ -439,24 +593,28 @@ class ADMMSolver:
                 )
 
                 if (
-                    current_constraint_violation <= self.tolerance
-                    and current_bound_violation <= self.tolerance
-                    and primal_residual <= self.tolerance
-                    and dual_residual <= self.tolerance
+                    current_constraint_violation
+                    <= self.tolerance
+                    and current_bound_violation
+                    <= self.tolerance
+                    and primal_residual
+                    <= self.tolerance
+                    and dual_residual
+                    <= self.tolerance
                 ):
                     status = "CONVERGED"
                     break
 
-        # ------------------------------------------------------------
-        # Final verification
-        # ------------------------------------------------------------
-
         cuda.synchronize()
 
-        x_cpu = cuda.to_cpu(x)
+        x_scaled = cuda.to_cpu(x)
+
+        x_cpu = self._unscale_solution(
+            x_scaled
+        )
 
         final_objective = float(
-            objective @ x_cpu
+            model.objective @ x_cpu
         )
 
         verification = verify_solution(
@@ -465,7 +623,10 @@ class ADMMSolver:
             final_objective
         )
 
-        solve_time = time.perf_counter() - start_time
+        solve_time = (
+            time.perf_counter() -
+            start_time
+        )
 
         if status == "CONVERGED":
             if verification["feasible"]:
@@ -480,47 +641,43 @@ class ADMMSolver:
             solve_time=float(solve_time),
             iterations=iteration,
             constraint_violation=float(
-                verification["constraint_violation"]
+                verification[
+                    "constraint_violation"
+                ]
             ),
             bound_violation=float(
-                verification["bound_violation"]
+                verification[
+                    "bound_violation"
+                ]
             ),
             backend=self.backend,
             problem_type=model.problem_type
         )
 
     def _solve_cpu(self, model):
-
         self._validate_model(model)
+        self._reset_histories()
 
-        A = model.A
-        objective = model.objective
-        constraint_lower = model.constraint_lower
-        constraint_upper = model.constraint_upper
-        variable_lower = model.variable_lower
-        variable_upper = model.variable_upper
+        scaled_model = self._equilibrate_model(model)
 
-        n = model.n_variables
-        m = model.n_constraints
+        A = scaled_model.A
+        objective = scaled_model.objective
+        constraint_lower = scaled_model.constraint_lower
+        constraint_upper = scaled_model.constraint_upper
+        variable_lower = scaled_model.variable_lower
+        variable_upper = scaled_model.variable_upper
 
-        self.objective_history_ = []
-        self.constraint_violation_history_ = []
-        self.primal_residual_history_ = []
-        self.dual_residual_history_ = []
+        n = scaled_model.n_variables
+        m = scaled_model.n_constraints
 
         start_time = time.perf_counter()
 
-        # Convert maximization into minimization.
-        if model.objective_sense == "min":
+        if scaled_model.objective_sense == "min":
             c = objective.copy()
         else:
             c = -objective.copy()
 
-        # ------------------------------------------------------------
-        # Initial point
-        # ------------------------------------------------------------
-
-        x = np.zeros(n)
+        x = np.zeros(n, dtype=float)
 
         finite_lower = np.isfinite(variable_lower)
         finite_upper = np.isfinite(variable_upper)
@@ -529,89 +686,35 @@ class ADMMSolver:
             x[finite_lower],
             variable_lower[finite_lower]
         )
-
         x[finite_upper] = np.minimum(
             x[finite_upper],
             variable_upper[finite_upper]
         )
 
         x_bar = x.copy()
+        y = np.zeros(m, dtype=float)
 
-        # Dual variable for Ax belonging to [lower, upper].
-        y = np.zeros(m)
+        tau, sigma = self._compute_diagonal_preconditioner(A)
 
-        # ------------------------------------------------------------
-        # Step sizes
-        #
-        # For primal-dual hybrid gradient:
-        #
-        #     tau * sigma * ||A||^2 < 1
-        #
-        # ------------------------------------------------------------
-
-        operator_norm = self._estimate_operator_norm(A)
-
-        if operator_norm <= 1e-12:
-            operator_norm = 1.0
-
-        tau = 0.9 / operator_norm
-        sigma = 0.9 / operator_norm
-
-        theta = 1.0
-
+        theta = self.initial_theta
+        previous_violation = np.inf
         status = "MAX_ITERATIONS_REACHED"
+        iteration = 0
 
-        final_constraint_violation = np.inf
-        final_bound_violation = np.inf
-
-        previous_x = x.copy()
-        previous_y = y.copy()
-
-        # ------------------------------------------------------------
-        # PDHG iterations
-        # ------------------------------------------------------------
+        finite_lower_constraint = np.isfinite(constraint_lower)
+        finite_upper_constraint = np.isfinite(constraint_upper)
 
         for iteration in range(1, self.max_iterations + 1):
-
-            # --------------------------------------------------------
-            # Dual update
-            #
-            # We need:
-            #
-            #     y = prox_{sigma f*}(y + sigma A x_bar)
-            #
-            # where f is the indicator function of:
-            #
-            #     lower <= z <= upper
-            #
-            # The conjugate proximal operator can be written through
-            # Moreau's identity:
-            #
-            #     prox_{sigma f*}(v)
-            #       = v - sigma * projection(v/sigma)
-            #
-            # --------------------------------------------------------
-
             y_previous = y.copy()
 
+            # Dual update: y <- prox_{sigma f*}(y + sigma A x_bar)
             v = y + sigma * (A @ x_bar)
-
-            z = np.minimum(
-                np.maximum(v / sigma, constraint_lower),
-                constraint_upper
-            )
-
-            # Handle infinite bounds correctly.
-            finite_lower_constraint = np.isfinite(constraint_lower)
-            finite_upper_constraint = np.isfinite(constraint_upper)
-
             z = v / sigma
 
             z[finite_lower_constraint] = np.maximum(
                 z[finite_lower_constraint],
                 constraint_lower[finite_lower_constraint]
             )
-
             z[finite_upper_constraint] = np.minimum(
                 z[finite_upper_constraint],
                 constraint_upper[finite_upper_constraint]
@@ -619,32 +722,23 @@ class ADMMSolver:
 
             y = v - sigma * z
 
-            # --------------------------------------------------------
-            # Primal update
-            #
-            # x = projection_bounds(
-            #       x - tau * (c + A.T y)
-            #     )
-            # --------------------------------------------------------
-
+            # Primal update.
             x_previous = x.copy()
-
             x = x - tau * (c + A.T @ y)
 
-            # Project onto variable bounds.
-            x = np.maximum(x, variable_lower)
-            x = np.minimum(x, variable_upper)
+            x[finite_lower] = np.maximum(
+                x[finite_lower],
+                variable_lower[finite_lower]
+            )
+            x[finite_upper] = np.minimum(
+                x[finite_upper],
+                variable_upper[finite_upper]
+            )
 
-            # --------------------------------------------------------
-            # Extrapolation
-            # --------------------------------------------------------
-
+            # Extrapolation.
             x_bar = x + theta * (x - x_previous)
 
-            # --------------------------------------------------------
-            # Diagnostics
-            # --------------------------------------------------------
-
+            # Diagnostics.
             Ax = A @ x
 
             current_constraint_violation = constraint_violation(
@@ -659,35 +753,37 @@ class ADMMSolver:
                 variable_upper
             )
 
-            primal_residual = np.linalg.norm(
-                x - x_previous
+            primal_residual = self._normalized_residual(
+                x,
+                x_previous
             )
 
-            dual_residual = np.linalg.norm(
-                y - y_previous
+            dual_residual = self._normalized_residual(
+                y,
+                y_previous
             )
 
-            original_objective = objective @ x
+            original_objective = model.objective @ x
 
             self.objective_history_.append(
                 float(original_objective)
             )
-
             self.constraint_violation_history_.append(
                 float(current_constraint_violation)
             )
-
             self.primal_residual_history_.append(
                 float(primal_residual)
             )
-
             self.dual_residual_history_.append(
                 float(dual_residual)
             )
 
-            # --------------------------------------------------------
-            # Convergence
-            # --------------------------------------------------------
+            theta = self._adapt_theta(
+                theta,
+                current_constraint_violation,
+                previous_violation
+            )
+            previous_violation = current_constraint_violation
 
             if (
                 current_constraint_violation <= self.tolerance
@@ -696,44 +792,23 @@ class ADMMSolver:
                 and dual_residual <= self.tolerance
             ):
                 status = "CONVERGED"
-
-                final_constraint_violation = (
-                    current_constraint_violation
-                )
-
-                final_bound_violation = (
-                    current_bound_violation
-                )
-
                 break
 
-        else:
-            final_constraint_violation = (
-                self.constraint_violation_history_[-1]
-            )
+        x_original = self._unscale_solution(x)
 
-            final_bound_violation = bound_violation(
-                x,
-                variable_lower,
-                variable_upper
-            )
-
-        # ------------------------------------------------------------
-        # Final verification
-        # ------------------------------------------------------------
-
-        final_objective = objective @ x
+        final_objective = float(
+            model.objective @ x_original
+        )
 
         verification = verify_solution(
             model,
-            x,
+            x_original,
             final_objective
         )
 
         solve_time = time.perf_counter() - start_time
 
         if status == "CONVERGED":
-
             if verification["feasible"]:
                 status = "FEASIBLE"
             else:
@@ -741,8 +816,8 @@ class ADMMSolver:
 
         return OptimizationResult(
             status=status,
-            objective=float(final_objective),
-            solution=x,
+            objective=final_objective,
+            solution=x_original,
             solve_time=float(solve_time),
             iterations=iteration,
             constraint_violation=float(
